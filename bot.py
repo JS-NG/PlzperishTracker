@@ -1,221 +1,136 @@
 import discord
 from discord.ext import tasks, commands
-from discord import app_commands
 import requests
 import asyncio
 import json
 import os
 
+# ---------------- CONFIG ---------------- #
 TOKEN = os.environ["TOKEN"]
+GUILD_ID = 1441878472170406031  # replace with your Discord server ID
+CHECK_INTERVAL = 60  # seconds between status updates
 
-
-# Default user IDs (always present, cannot be removed)
+# Default Roblox IDs (always tracked)
 DEFAULT_USER_IDS = [
-    8447038336,
-    8447064756,
-    8447079827,
-    8447109786,
-    8447185938,
-    8447226387,
-    8447260393,
-    8447660792,
-    8447646077,
-    8447668063,
-    8447701884,
-    8447818820,
-    8447826973,
-    8447863656,
-    8447924262
+    8447038336, 8447064756, 8447079827, 8447109786, 8447185938,
+    8447226387, 8447260393, 8447660792, 8447646077, 8447668063,
+    8447701884, 8447818820, 8447826973, 8447863656, 8447924262
 ]
 
-TRACKED_USERS_FILE = "tracked_users.json"
+# JSON files
+USERS_JSON = "tracked_users.json"
+CHANNELS_JSON = "tracked_channels.json"
 
-# Load tracked users (includes default + added users)
-if os.path.exists(TRACKED_USERS_FILE):
-    try:
-        with open(TRACKED_USERS_FILE, "r") as f:
-            data = json.load(f)
-            TRACKED_USERS = list(set(DEFAULT_USER_IDS + data))
-    except:
-        TRACKED_USERS = DEFAULT_USER_IDS.copy()
-else:
-    TRACKED_USERS = DEFAULT_USER_IDS.copy()
-
-# Helper function to save only additional users (not defaults) to JSON
-def save_tracked_users():
-    additional_users = [uid for uid in TRACKED_USERS if uid not in DEFAULT_USER_IDS]
-    with open(TRACKED_USERS_FILE, "w") as f:
-        json.dump(additional_users, f, indent=4)
-
-STATUS_MAP = {0: "offline", 1: "online", 2: "ingame", 3: "studio"}
-tracked_channels = {}
-discord_ratelimit_delay = 1.0
-
-# Roblox API functions (same as before)
-def get_user_id_from_username(username):
-    url = "https://users.roblox.com/v1/usernames/users"
-    payload = {"usernames": [username], "excludeBannedUsers": False}
-    r = requests.post(url, json=payload)
-    if r.status_code != 200:
-        return None
-    data = r.json().get("data", [])
-    if not data:
-        return None
-    return data[0]["id"]
-
-def get_user_info(user_id):
-    r = requests.get(f"https://users.roblox.com/v1/users/{user_id}")
-    if r.status_code != 200:
-        return None
-    return r.json()
-
-def get_presence(user_id):
-    url = "https://presence.roblox.com/v1/presence/users"
-    payload = {"userIds": [user_id]}
-    r = requests.post(url, json=payload)
-    if r.status_code != 200:
-        return None
-    data = r.json().get("userPresences", [])
-    return data[0] if data else None
-
-def get_status_string(user_id):
-    info = get_user_info(user_id)
-    if not info:
-        return None, "unknown"
-    if info.get("isBanned", False):
-        return info["name"], "banned"
-    presence = get_presence(user_id)
-    if not presence:
-        return info["name"], "unknown"
-    return info["name"], STATUS_MAP.get(presence["userPresenceType"], "unknown")
-
-# Discord setup
+# ---------------- INIT ---------------- #
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True
+intents.messages = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Load additional tracked users from JSON
+if os.path.exists(USERS_JSON):
+    with open(USERS_JSON, "r") as f:
+        additional_users = json.load(f)
+else:
+    additional_users = []
+
+tracked_users = list(set(DEFAULT_USER_IDS + additional_users))
+
+# Load tracked channels
+if os.path.exists(CHANNELS_JSON):
+    with open(CHANNELS_JSON, "r") as f:
+        tracked_channels = json.load(f)
+else:
+    tracked_channels = {}
+
+# ---------------- HELPERS ---------------- #
+def save_tracked_users():
+    with open(USERS_JSON, "w") as f:
+        json.dump(list(set(additional_users)), f)
+
+def save_tracked_channels():
+    with open(CHANNELS_JSON, "w") as f:
+        json.dump(tracked_channels, f)
+
+async def get_roblox_status(user_id):
+    try:
+        response = requests.get(f"https://api.roblox.com/users/{user_id}/onlinestatus").json()
+        # Example API response handling
+        if response.get("IsOnline") is True:
+            return "Online"
+        elif response.get("IsOnline") is False:
+            return "Offline"
+        elif response.get("IsBanned"):
+            return "Banned"
+        else:
+            return "Unknown"
+    except Exception:
+        return "Error"
+
+# ---------------- STATUS UPDATER ---------------- #
+@tasks.loop(seconds=CHECK_INTERVAL)
+async def update_status_channels():
+    guild = bot.get_guild(GUILD_ID)
+    if not guild:
+        return
+
+    for user_id in tracked_users:
+        status = await get_roblox_status(user_id)
+        channel_name = f"{user_id} : {status}"
+
+        # Use existing channel if exists
+        if str(user_id) in tracked_channels:
+            channel = bot.get_channel(tracked_channels[str(user_id)])
+            if channel:
+                try:
+                    await channel.edit(name=channel_name)
+                except discord.errors.Forbidden:
+                    pass
+        else:
+            # Create new private channel
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(read_messages=False)
+            }
+            channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
+            tracked_channels[str(user_id)] = channel.id
+            save_tracked_channels()
+        await asyncio.sleep(1)  # avoid rate limits
+
+# ---------------- BOT EVENTS ---------------- #
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
-    asyncio.create_task(bot.tree.sync())
-    updater_loop.start()
+    update_status_channels.start()
 
-# Safe edit for rate limits
-async def safe_edit_channel(channel, **kwargs):
-    global discord_ratelimit_delay
-    while True:
-        try:
-            await asyncio.sleep(discord_ratelimit_delay)
-            return await channel.edit(**kwargs)
-        except discord.HTTPException as e:
-            if e.status == 429:
-                retry = getattr(e, "retry_after", discord_ratelimit_delay * 2)
-                discord_ratelimit_delay = min(retry, 10)
-                await asyncio.sleep(discord_ratelimit_delay)
-            else:
-                return None
+# ---------------- SLASH COMMANDS ---------------- #
+@bot.slash_command(name="check", description="Check status of a Roblox user by ID")
+async def check(ctx, user_id: int):
+    status = await get_roblox_status(user_id)
+    await ctx.respond(f"User {user_id} status: {status}")
 
-# Create channel
-async def create_tracking_channel(guild, user_id):
-    name, status = get_status_string(user_id)
-    if not name:
-        return None
-    overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False)}
-    channel_name = f"{name.lower()}-{status}"
-    channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
-    tracked_channels[user_id] = channel.id
-    return channel
-
-# /adduser command
-@bot.tree.command(name="adduser", description="Start tracking a Roblox user.")
-@app_commands.describe(query="Username or userId")
-async def adduser(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    guild = interaction.guild
-    if query.isdigit():
-        user_id = int(query)
+@bot.slash_command(name="adduser", description="Add a Roblox user to track")
+async def adduser(ctx, user_id: int):
+    if user_id not in tracked_users:
+        tracked_users.append(user_id)
+        additional_users.append(user_id)
+        save_tracked_users()
+        await ctx.respond(f"Added user {user_id} to tracking list.")
     else:
-        user_id = get_user_id_from_username(query)
-        if not user_id:
-            await interaction.followup.send("User not found.")
-            return
-    if user_id in TRACKED_USERS:
-        await interaction.followup.send("Already being tracked.")
-        return
-    TRACKED_USERS.append(user_id)
-    save_tracked_users()
-    channel = await create_tracking_channel(guild, user_id)
-    await interaction.followup.send(f"Now tracking **{user_id}** in <#{channel.id}>")
+        await ctx.respond(f"User {user_id} is already tracked.")
 
-# /removeuser command
-@bot.tree.command(name="removeuser", description="Stop tracking a Roblox user.")
-@app_commands.describe(query="Username or userId")
-async def removeuser(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    guild = interaction.guild
-    if query.isdigit():
-        user_id = int(query)
+@bot.slash_command(name="removeuser", description="Remove a Roblox user from tracking")
+async def removeuser(ctx, user_id: int):
+    if user_id in additional_users:
+        tracked_users.remove(user_id)
+        additional_users.remove(user_id)
+        save_tracked_users()
+        await ctx.respond(f"Removed user {user_id} from tracking list.")
+    elif user_id in DEFAULT_USER_IDS:
+        await ctx.respond(f"Cannot remove default user {user_id}.")
     else:
-        user_id = get_user_id_from_username(query)
-        if not user_id:
-            await interaction.followup.send("User not found.")
-            return
-    if user_id in DEFAULT_USER_IDS:
-        await interaction.followup.send("Cannot remove default user IDs.")
-        return
-    if user_id not in TRACKED_USERS:
-        await interaction.followup.send("User not tracked.")
-        return
-    TRACKED_USERS.remove(user_id)
-    save_tracked_users()
-    channel_id = tracked_channels.get(user_id)
-    if channel_id:
-        channel = guild.get_channel(channel_id)
-        if channel:
-            await channel.delete()
-    tracked_channels.pop(user_id, None)
-    await interaction.followup.send(f"Stopped tracking **{user_id}**.")
+        await ctx.respond(f"User {user_id} is not tracked.")
 
-# /check command
-@bot.tree.command(name="check", description="Check Roblox user status.")
-@app_commands.describe(query="Username or userId")
-async def check(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
-    if query.isdigit():
-        user_id = int(query)
-    else:
-        user_id = get_user_id_from_username(query)
-        if not user_id:
-            await interaction.followup.send("User not found.")
-            return
-    name, status = get_status_string(user_id)
-    await interaction.followup.send(f"**{name}** is **{status.upper()}**")
-
-# Updater loop with sync
-@tasks.loop(seconds=5)
-async def updater_loop():
-    guild = bot.guilds[0]
-    # Create channels for all users
-    for user_id in TRACKED_USERS:
-        if user_id not in tracked_channels:
-            await create_tracking_channel(guild, user_id)
-        channel = guild.get_channel(tracked_channels[user_id])
-        if not channel:
-            continue
-        name, status = get_status_string(user_id)
-        if not name:
-            continue
-        new_name = f"{name.lower()}-{status}"
-        if channel.name != new_name:
-            await safe_edit_channel(channel, name=new_name)
-        await asyncio.sleep(0.7)  # avoid Discord rate limits
-
+# ---------------- RUN BOT ---------------- #
 bot.run(TOKEN)
-
-# ---------------- JSON Format Example ----------------
-# The saved JSON file (tracked_users.json) will look like:
-# [
-#     123456789,    <- added user ID
-#     987654321     <- added user ID
-# ]
-# The default user IDs are not stored in JSON, but always loaded in memory.
